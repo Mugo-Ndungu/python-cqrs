@@ -58,7 +58,8 @@ class EventProducer:
         ``flush_counter`` reaches five. ``OutboxModel.get_batch_query`` then
         excludes it, so a later poll will not yield it. Inspect those
         exhausted rows and repair or delete them; this producer does not
-        select them again.
+        select them again. ``python -m cqrs.cli.outbox requeue`` hands them
+        back with a fresh budget.
         """
         try:
             logger.debug(f"Send event {event.event.event_id} into topic {event.topic}")
