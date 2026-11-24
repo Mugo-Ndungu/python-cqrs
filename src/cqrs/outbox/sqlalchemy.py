@@ -45,7 +45,7 @@ dotenv.load_dotenv()
 
 DEFAULT_OUTBOX_TABLE_NAME = "outbox"
 
-MAX_FLUSH_COUNTER_VALUE = 5
+MAX_FLUSH_COUNTER_VALUE = repository.MAX_FLUSH_COUNTER_VALUE
 
 # SKIP LOCKED arrived in MySQL 8.0 and MariaDB 10.6. PostgreSQL has it
 # without a version gate. Older servers and every other dialect stay unlocked.
@@ -362,6 +362,68 @@ class SqlAlchemyOutboxedEventRepository(repository.OutboxedEventRepository):
         await self.session.execute(
             statement=self._model.update_status_query(outboxed_event_id, new_status),
         )
+
+    async def list_rows(
+        self,
+        *,
+        topics: typing.Sequence[str],
+        since: datetime.datetime,
+    ) -> typing.List[repository.OutboxRow]:
+        model = self._model
+        if since.tzinfo is not None:
+            since = since.astimezone().replace(tzinfo=None)
+        query = (
+            sqlalchemy.select(
+                model.id,
+                model.event_id,
+                model.event_name,
+                model.topic,
+                model.event_status,
+                model.flush_counter,
+                model.created_at,
+            )
+            .where(model.topic.in_(list(topics)), model.created_at >= since)
+            .order_by(model.id.asc())
+        )
+        result = await self.session.execute(query)
+        return [
+            repository.OutboxRow(
+                id=row.id,
+                event_id=row.event_id,
+                event_name=row.event_name,
+                topic=row.topic,
+                status=repository.EventStatus(row.event_status),
+                flush_counter=row.flush_counter,
+                created_at=row.created_at,
+            )
+            for row in result.all()
+        ]
+
+    async def _reset(self, ids: typing.Sequence[int], *, produced: bool) -> typing.List[int]:
+        if not ids:
+            return []
+        model = self._model
+        wanted = repository.EventStatus.PRODUCED if produced else repository.EventStatus.NOT_PRODUCED
+        condition = sqlalchemy.and_(model.id.in_(sorted(set(ids))), model.event_status == wanted)
+        # Lock first: MySQL has no UPDATE ... RETURNING, and the ids reported
+        # back must be the ones this transaction actually changed.
+        selected = await self.session.execute(
+            sqlalchemy.select(model.id).where(condition).order_by(model.id).with_for_update(),
+        )
+        changed = [row_id for (row_id,) in selected.all()]
+        if changed:
+            await self.session.execute(
+                sqlalchemy.update(model)
+                .where(model.id.in_(changed))
+                .values(event_status=repository.EventStatus.NEW, flush_counter=0),
+            )
+        return changed
+
+    async def republish(self, ids: typing.Sequence[int]) -> typing.List[int]:
+        return await self._reset(ids, produced=True)
+
+    async def requeue(self, ids: typing.Sequence[int]) -> typing.List[int]:
+        return await self._reset(ids, produced=False)
 
     async def commit(self):
         await self.session.commit()
