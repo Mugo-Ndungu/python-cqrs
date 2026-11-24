@@ -1,8 +1,10 @@
 import abc
 import dataclasses
+import datetime
 import enum
 import sys
 import typing
+import uuid
 
 import cqrs
 from cqrs.models.event import INotificationEvent
@@ -30,6 +32,10 @@ class EventStatus(StrEnum):
     NEW = "new"
     PRODUCED = "produced"
     NOT_PRODUCED = "not_produced"
+
+
+# A row that has failed this many sends drops out of ``get_many``.
+MAX_FLUSH_COUNTER_VALUE = 5
 
 
 @dataclasses.dataclass(frozen=True)
@@ -72,6 +78,28 @@ class OutboxedEvent:
     status: EventStatus
     payload_bytes: bytes | None = None
     content_type: str | None = None
+
+
+@dataclasses.dataclass(frozen=True)
+class OutboxRow:
+    """
+    An outbox row as stored, without decoding the payload.
+
+    ``created_at`` is naive and in local time, the same way
+    ``NotificationEvent.event_timestamp`` is written by default.
+    """
+
+    id: int
+    event_id: uuid.UUID
+    event_name: str
+    topic: str
+    status: EventStatus
+    flush_counter: int
+    created_at: datetime.datetime
+
+    @property
+    def exhausted(self) -> bool:
+        return self.status is not EventStatus.PRODUCED and self.flush_counter >= MAX_FLUSH_COUNTER_VALUE
 
 
 class OutboxedEventRepository(abc.ABC):
@@ -135,6 +163,37 @@ class OutboxedEventRepository(abc.ABC):
         flip status by hand.
         """
 
+    async def list_rows(
+        self,
+        *,
+        topics: typing.Sequence[str],
+        since: datetime.datetime,
+    ) -> typing.List[OutboxRow]:
+        """
+        Return every row on ``topics`` created at or after ``since``, ordered
+        by id, whatever its status.
+
+        ``since`` is naive local time. Nothing is locked, decoded or updated,
+        so rows whose event name is not registered are returned as well.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support reconciliation")
+
+    async def republish(self, ids: typing.Sequence[int]) -> typing.List[int]:
+        """
+        Put ``PRODUCED`` rows back to ``NEW`` with a fresh retry budget so the
+        producer sends them again. Rows in any other status are left alone.
+        Returns the ids that changed.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support reconciliation")
+
+    async def requeue(self, ids: typing.Sequence[int]) -> typing.List[int]:
+        """
+        Put ``NOT_PRODUCED`` rows back to ``NEW`` with a fresh retry budget,
+        typically ones that ran out of retries. Rows in any other status are
+        left alone. Returns the ids that changed.
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not support reconciliation")
+
     @abc.abstractmethod
     async def commit(self):
         """
@@ -155,7 +214,9 @@ class OutboxedEventRepository(abc.ABC):
 
 
 __all__ = (
+    "MAX_FLUSH_COUNTER_VALUE",
     "EventStatus",
+    "OutboxRow",
     "OutboxedEvent",
     "OutboxedEventRepository",
 )
